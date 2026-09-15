@@ -13,9 +13,11 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::events;
 use crate::output;
 use crate::policy::{self, PermissionPolicy};
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -26,6 +28,7 @@ pub struct AcpClient {
     tx: mpsc::UnboundedSender<Message>,
     pending: PendingRequests,
     next_id: AtomicI64,
+    initialized: Mutex<Option<acp::InitializeResponse>>,
 }
 
 impl AcpClient {
@@ -35,8 +38,14 @@ impl AcpClient {
         permission: PermissionPolicy,
         stream_events: bool,
     ) -> Result<Self> {
-        let (socket, _) = connect_async(url)
+        let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "connect {endpoint} timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
             .with_context(|| format!("connect {endpoint}"))?;
         let (mut write, mut read) = socket.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -86,19 +95,26 @@ impl AcpClient {
             tx,
             pending,
             next_id: AtomicI64::new(1),
+            initialized: Mutex::new(None),
         })
     }
 
     pub async fn initialize(&self) -> Result<acp::InitializeResponse> {
-        self.request(
-            acp::InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(client_capabilities())
-                .client_info(acp::Implementation::new(
-                    "qmtacp",
-                    env!("CARGO_PKG_VERSION"),
-                )),
-        )
-        .await
+        if let Some(cached) = self.initialized.lock().await.clone() {
+            return Ok(cached);
+        }
+        let response = self
+            .request(
+                acp::InitializeRequest::new(ProtocolVersion::V1)
+                    .client_capabilities(client_capabilities())
+                    .client_info(acp::Implementation::new(
+                        "qmtacp",
+                        env!("CARGO_PKG_VERSION"),
+                    )),
+            )
+            .await?;
+        *self.initialized.lock().await = Some(response.clone());
+        Ok(response)
     }
 
     pub async fn extension(&self, method: &str, params: Value) -> Result<Value> {
@@ -304,11 +320,11 @@ async fn handle_inbound(
         .to_string();
     let params = value.get("params").cloned().unwrap_or(Value::Null);
     if stream_events && method == "session/update" {
-        let _ = output::write_event(&json!({
-            "type": "update",
-            "sessionId": params.get("sessionId"),
-            "update": params.get("update"),
-        }));
+        let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
+        let update = params.get("update").cloned().unwrap_or(Value::Null);
+        if let Some(event) = events::compact_session_update(&session_id, &update) {
+            let _ = output::write_event(&event);
+        }
     }
 
     if let Some(id) = value.get("id").cloned() {

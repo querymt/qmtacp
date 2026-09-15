@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod error;
+mod events;
 mod output;
 mod policy;
 mod session;
@@ -61,10 +62,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     )
     .map_err(|err| CliError::Usage(err.to_string()))?;
     let endpoint = safe_endpoint_label(&url).map_err(|err| CliError::Usage(err.to_string()))?;
-    let stream_events = matches!(cli.command, Command::Prompt { .. });
+    let stream_events = matches!(cli.command, Command::Prompt { .. } | Command::Exec { .. });
     eprintln!("connecting {endpoint}");
     let client = AcpClient::connect(&url, &endpoint, cli.permission, stream_events)
         .await
-        .map_err(CliError::connection)?;
+        .map_err(|err| CliError::connection_with_cause(&endpoint, err))?;
     Ok(commands::run(&client, cli.command, cli.pretty).await?.exit)
 }

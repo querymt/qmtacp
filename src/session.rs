@@ -34,12 +34,24 @@ pub fn profile_meta(profile_id: &str) -> Map<String, Value> {
 }
 
 pub fn session_summary(session: &acp::SessionInfo) -> Value {
+    compact_session_summary(session)
+}
+
+pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
+    let meta = session
+        .meta
+        .as_ref()
+        .and_then(|meta| serde_json::to_value(meta).ok())
+        .unwrap_or(Value::Null);
+    let runtime = meta.get("runtimeStatus").cloned().unwrap_or(Value::Null);
     json!({
         "sessionId": session.session_id.to_string(),
         "cwd": path_string(&session.cwd),
         "title": session.title,
         "updatedAt": session.updated_at,
-        "meta": session.meta,
+        "phase": runtime.get("phase").cloned(),
+        "messageCount": meta.get("messageCount").cloned(),
+        "runtime": runtime,
     })
 }
 
@@ -90,14 +102,26 @@ pub fn compact_inspect(
     modes: Option<&acp::SessionModeState>,
     config_options: Option<&[acp::SessionConfigOption]>,
     load_value: &Value,
+    message_limit: Option<usize>,
+    include_tools: bool,
 ) -> Value {
     let snapshot = session_load_snapshot(load_value);
+    let mut messages = compact_messages(snapshot);
+    if let Some(limit) = message_limit.filter(|limit| *limit > 0)
+        && messages.len() > limit
+    {
+        messages = messages.split_off(messages.len() - limit);
+    }
     json!({
         "sessionId": session_id,
         "cwd": path_string(cwd),
         "status": config_status(session_id, modes, config_options),
-        "messages": compact_messages(snapshot),
-        "tools": compact_tools(snapshot),
+        "messages": messages,
+        "tools": if include_tools {
+            Value::Array(compact_tools(snapshot))
+        } else {
+            Value::Array(Vec::new())
+        },
         "errors": compact_errors(snapshot),
     })
 }
@@ -208,12 +232,27 @@ fn compact_errors(snapshot: Option<&Value>) -> Vec<Value> {
         .collect()
 }
 
-pub fn matches_query(session: &Value, query: &str) -> bool {
+pub fn matches_query_and_phase(session: &Value, query: &str, phase: Option<&str>) -> bool {
+    if let Some(phase) = phase {
+        let current = session
+            .get("phase")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                session
+                    .get("runtime")
+                    .and_then(|runtime| runtime.get("phase"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("");
+        if !current.eq_ignore_ascii_case(phase) {
+            return false;
+        }
+    }
     let query = query.to_ascii_lowercase();
     if query.is_empty() {
         return true;
     }
-    for key in ["sessionId", "title", "cwd"] {
+    for key in ["sessionId", "title", "cwd", "phase"] {
         if session
             .get(key)
             .and_then(Value::as_str)
@@ -223,6 +262,32 @@ pub fn matches_query(session: &Value, query: &str) -> bool {
         }
     }
     false
+}
+
+pub fn filter_models(payload: Value, query: Option<&str>, provider: Option<&str>) -> Value {
+    let mut root = payload;
+    let Some(models) = root.get_mut("models").and_then(Value::as_array_mut) else {
+        return root;
+    };
+    models.retain(|model| {
+        let provider_ok = provider.is_none_or(|wanted| {
+            model
+                .get("provider")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(wanted))
+        });
+        let query_ok = query.is_none_or(|wanted| {
+            let wanted = wanted.to_ascii_lowercase();
+            ["id", "label", "model", "provider"].iter().any(|key| {
+                model
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&wanted))
+            })
+        });
+        provider_ok && query_ok
+    });
+    root
 }
 
 pub fn find_page_cap() -> usize {
@@ -305,7 +370,7 @@ mod tests {
                 }
             }
         });
-        let compact = compact_inspect("s1", Path::new("/repo"), None, None, &load);
+        let compact = compact_inspect("s1", Path::new("/repo"), None, None, &load, None, true);
         assert_eq!(compact["messages"][0]["role"], "user");
         assert_eq!(compact["messages"][0]["text"], "hello");
         assert_eq!(compact["tools"][0]["name"], "read");
@@ -319,9 +384,21 @@ mod tests {
             "title": "Fix build",
             "cwd": "/tmp/project"
         });
-        assert!(matches_query(&session, "abc"));
-        assert!(matches_query(&session, "build"));
-        assert!(matches_query(&session, "project"));
-        assert!(!matches_query(&session, "missing"));
+        assert!(matches_query_and_phase(&session, "abc", None));
+        assert!(matches_query_and_phase(&session, "build", None));
+        assert!(matches_query_and_phase(&session, "project", None));
+        assert!(!matches_query_and_phase(&session, "missing", None));
+    }
+
+    #[test]
+    fn find_can_filter_by_phase() {
+        let session = json!({
+            "sessionId": "abc-123",
+            "title": "Fix build",
+            "cwd": "/tmp/project",
+            "phase": "tools"
+        });
+        assert!(matches_query_and_phase(&session, "build", Some("tools")));
+        assert!(!matches_query_and_phase(&session, "build", Some("idle")));
     }
 }
