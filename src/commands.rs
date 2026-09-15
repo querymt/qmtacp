@@ -4,13 +4,22 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
 use crate::client::AcpClient;
 use crate::error::{CliError, ExitCode};
 use crate::output;
 use crate::session;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum Delivery {
+    #[default]
+    Auto,
+    Prompt,
+    Steer,
+    Queue,
+}
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -104,12 +113,26 @@ pub enum Command {
         effort: Option<String>,
         #[arg(long)]
         timeout: Option<u64>,
+        /// How to send text to an existing session.
+        #[arg(long, value_enum, default_value_t = Delivery::Auto)]
+        delivery: Delivery,
+        /// Wait until runtime is idle, including queued turns. Default true.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        until_idle: bool,
         /// `SESSION_ID TEXT` or, with --new, just `TEXT`. Use `-` to read stdin.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Current QueryMT runtime state for a session.
     Runtime { session_id: String },
+    /// Stream compact session events until idle.
+    Follow {
+        session_id: String,
+        #[arg(long, default_value_t = 1)]
+        interval: u64,
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
     /// Poll runtime state until idle or timeout.
     Watch {
         session_id: String,
@@ -214,6 +237,8 @@ pub async fn run(
             model,
             effort,
             timeout,
+            delivery,
+            until_idle,
             args,
         } => {
             prompt(
@@ -226,6 +251,8 @@ pub async fn run(
                     model,
                     effort,
                     timeout,
+                    delivery,
+                    until_idle,
                     args,
                     pretty,
                 },
@@ -233,6 +260,11 @@ pub async fn run(
             .await
         }
         Command::Runtime { session_id } => write_ok(pretty, runtime(client, session_id).await?),
+        Command::Follow {
+            session_id,
+            interval,
+            timeout,
+        } => follow(client, session_id, interval, timeout, pretty).await,
         Command::Watch {
             session_id,
             interval,
@@ -567,6 +599,8 @@ struct PromptArgs {
     model: Option<String>,
     effort: Option<String>,
     timeout: Option<u64>,
+    delivery: Delivery,
+    until_idle: bool,
     args: Vec<String>,
     pretty: bool,
 }
@@ -580,6 +614,8 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         model,
         effort,
         timeout,
+        delivery,
+        until_idle,
         args,
         pretty,
     } = args;
@@ -603,24 +639,88 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         session_id
     };
     apply_config(client, &session_id, mode, model, effort).await?;
+    let chosen = if new {
+        Delivery::Prompt
+    } else {
+        choose_delivery(client, &session_id, delivery).await?
+    };
     output::write_event(&json!({
         "type": "session",
         "sessionId": session_id,
         "cwd": cwd,
+        "delivery": delivery_name(chosen),
     }))
     .map_err(CliError::rpc)?;
+    let _ = client.take_assistant_text().await;
 
     let timeout = timeout.map(Duration::from_secs);
-    let response = client
-        .prompt(session_id.clone(), text, timeout)
+    let stop_reason = match chosen {
+        Delivery::Prompt => {
+            let response = client
+                .prompt(session_id.clone(), text, timeout)
+                .await
+                .map_err(CliError::from_request)?;
+            stop_reason_name(&response.stop_reason)
+        }
+        Delivery::Steer => {
+            submit_input(
+                client,
+                "querymt/session/steer",
+                session_id.clone(),
+                None,
+                vec![text],
+            )
+            .await?;
+            "steered".to_string()
+        }
+        Delivery::Queue => {
+            submit_input(
+                client,
+                "querymt/session/queue",
+                session_id.clone(),
+                None,
+                vec![text],
+            )
+            .await?;
+            "queued".to_string()
+        }
+        Delivery::Auto => unreachable!("auto is resolved before send"),
+    };
+
+    let mut text = client.take_assistant_text().await;
+    if until_idle {
+        wait_until_idle(
+            client,
+            &session_id,
+            timeout.unwrap_or(Duration::from_secs(120)),
+        )
+        .await?;
+        let more = client.snapshot_assistant_text().await;
+        if !more.is_empty() {
+            text = more;
+        }
+        if let Ok(inspected) = inspect(
+            client,
+            session_id.clone(),
+            Some(cwd.clone()),
+            false,
+            Some(12),
+            false,
+        )
         .await
-        .map_err(CliError::from_request)?;
-    let stop_reason = stop_reason_name(&response.stop_reason);
+            && let Some(last) = session::last_assistant_text(&inspected)
+        {
+            text = last;
+        }
+    }
+
     let done = json!({
         "type": "done",
         "ok": true,
         "sessionId": session_id,
+        "delivery": delivery_name(chosen),
         "stopReason": stop_reason,
+        "text": text,
         "loadSession": initialized.agent_capabilities.load_session,
     });
     if pretty {
@@ -631,6 +731,114 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     Ok(CommandOutcome {
         exit: output::exit_for_stop_reason(&stop_reason),
     })
+}
+
+fn delivery_name(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Auto => "auto",
+        Delivery::Prompt => "prompt",
+        Delivery::Steer => "steer",
+        Delivery::Queue => "queue",
+    }
+}
+
+async fn choose_delivery(
+    client: &AcpClient,
+    session_id: &str,
+    requested: Delivery,
+) -> Result<Delivery, CliError> {
+    if requested != Delivery::Auto {
+        return Ok(requested);
+    }
+    let state = runtime(client, session_id.to_string()).await?;
+    let phase = state
+        .pointer("/runtime/phase")
+        .and_then(Value::as_str)
+        .unwrap_or("idle");
+    let steerable = state
+        .pointer("/runtime/steerable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(delivery_from_runtime(phase, steerable))
+}
+
+fn delivery_from_runtime(phase: &str, steerable: bool) -> Delivery {
+    if phase == "idle" {
+        Delivery::Prompt
+    } else if steerable {
+        Delivery::Steer
+    } else {
+        Delivery::Queue
+    }
+}
+
+async fn wait_until_idle(
+    client: &AcpClient,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<(), CliError> {
+    wait_until_idle_every(client, session_id, timeout, Duration::from_millis(400)).await
+}
+
+async fn wait_until_idle_every(
+    client: &AcpClient,
+    session_id: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(), CliError> {
+    let deadline = tokio::time::Instant::now() + timeout.max(Duration::from_secs(1));
+    loop {
+        let value = runtime(client, session_id.to_string()).await?;
+        let phase = value
+            .pointer("/runtime/phase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if phase == "idle" {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CliError::Timeout(format!(
+                "timed out after {}s while session {session_id} was {phase}",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(interval.max(Duration::from_millis(200))).await;
+    }
+}
+
+async fn follow(
+    client: &AcpClient,
+    session_id: String,
+    interval: u64,
+    timeout: u64,
+    pretty: bool,
+) -> Result<CommandOutcome, CliError> {
+    client.initialize().await.map_err(CliError::from_request)?;
+    let cwd = session::resolve_cwd(None).map_err(CliError::rpc)?;
+    let _ = open_session(client, session_id.clone(), cwd).await;
+    let _ = client.take_assistant_text().await;
+    wait_until_idle_every(
+        client,
+        &session_id,
+        Duration::from_secs(timeout.max(1)),
+        Duration::from_secs(interval.max(1)),
+    )
+    .await?;
+    let text = client.take_assistant_text().await;
+    let done = json!({
+        "type": "done",
+        "ok": true,
+        "sessionId": session_id,
+        "stopReason": "idle",
+        "text": text,
+        "interval": interval,
+    });
+    if pretty {
+        output::write_json(&done, true).map_err(CliError::rpc)?;
+    } else {
+        output::write_event(&done).map_err(CliError::rpc)?;
+    }
+    Ok(CommandOutcome { exit: ExitCode::Ok })
 }
 
 async fn runtime(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
@@ -978,5 +1186,29 @@ mod tests {
             split_exec_args(r#"prompt --new "fix the build""#),
             vec!["prompt", "--new", "fix the build"]
         );
+    }
+
+    #[test]
+    fn auto_delivery_is_prompt_when_idle() {
+        assert!(matches!(
+            delivery_from_runtime("idle", false),
+            Delivery::Prompt
+        ));
+    }
+
+    #[test]
+    fn auto_delivery_steers_when_steerable() {
+        assert!(matches!(
+            delivery_from_runtime("tools", true),
+            Delivery::Steer
+        ));
+    }
+
+    #[test]
+    fn auto_delivery_queues_when_busy_and_not_steerable() {
+        assert!(matches!(
+            delivery_from_runtime("closing", false),
+            Delivery::Queue
+        ));
     }
 }

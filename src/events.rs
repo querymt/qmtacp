@@ -1,5 +1,17 @@
 use serde_json::{Value, json};
 
+pub fn observe_assistant_text(buffer: &mut String, event: &Value) {
+    if event.get("type").and_then(Value::as_str) != Some("text") {
+        return;
+    }
+    if event.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    if let Some(text) = event.get("text").and_then(Value::as_str) {
+        buffer.push_str(text);
+    }
+}
+
 pub fn compact_session_update(session_id: &Value, update: &Value) -> Option<Value> {
     let kind = update
         .get("sessionUpdate")
@@ -126,5 +138,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mode["mode"], "plan");
+    }
+
+    #[test]
+    fn observe_assistant_text_concatenates_chunks() {
+        let mut text = String::new();
+        observe_assistant_text(
+            &mut text,
+            &json!({"type":"text","role":"assistant","text":"STE"}),
+        );
+        observe_assistant_text(
+            &mut text,
+            &json!({"type":"text","role":"user","text":"ignore"}),
+        );
+        observe_assistant_text(
+            &mut text,
+            &json!({"type":"text","role":"assistant","text":"ERED"}),
+        );
+        assert_eq!(text, "STEERED");
     }
 }

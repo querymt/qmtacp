@@ -298,6 +298,18 @@ pub fn find_page_cap() -> usize {
     FIND_PAGE_CAP
 }
 
+pub fn last_assistant_text(inspect: &Value) -> Option<String> {
+    inspect
+        .get("messages")
+        .and_then(Value::as_array)?
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|message| message.get("text").and_then(Value::as_str))
+        .map(str::to_string)
+        .filter(|text| !text.is_empty())
+}
+
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -404,6 +416,18 @@ mod tests {
         });
         assert!(matches_query_and_phase(&session, "build", Some("tools")));
         assert!(!matches_query_and_phase(&session, "build", Some("idle")));
+    }
+
+    #[test]
+    fn last_assistant_text_uses_newest_assistant_message() {
+        let inspect = json!({
+            "messages": [
+                {"role":"user","text":"hi"},
+                {"role":"assistant","text":"first"},
+                {"role":"assistant","text":"STEERED"}
+            ]
+        });
+        assert_eq!(last_assistant_text(&inspect).as_deref(), Some("STEERED"));
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub struct AcpClient {
     pending: PendingRequests,
     next_id: AtomicI64,
     initialized: Mutex<Option<acp::InitializeResponse>>,
+    assistant_text: Arc<Mutex<String>>,
 }
 
 impl AcpClient {
@@ -64,6 +65,8 @@ impl AcpClient {
 
         let pending_read = pending.clone();
         let tx_read = tx.clone();
+        let assistant_text = Arc::new(Mutex::new(String::new()));
+        let assistant_read = assistant_text.clone();
         tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
@@ -71,6 +74,7 @@ impl AcpClient {
                         if let Err(err) = handle_inbound(
                             &pending_read,
                             &tx_read,
+                            &assistant_read,
                             text.as_ref(),
                             permission,
                             stream_events,
@@ -96,7 +100,17 @@ impl AcpClient {
             pending,
             next_id: AtomicI64::new(1),
             initialized: Mutex::new(None),
+            assistant_text,
         })
+    }
+
+    pub async fn take_assistant_text(&self) -> String {
+        let mut text = self.assistant_text.lock().await;
+        std::mem::take(&mut *text)
+    }
+
+    pub async fn snapshot_assistant_text(&self) -> String {
+        self.assistant_text.lock().await.clone()
     }
 
     pub async fn initialize(&self) -> Result<acp::InitializeResponse> {
@@ -314,6 +328,7 @@ async fn fail_pending(pending: &PendingRequests, message: impl Into<String>) {
 async fn handle_inbound(
     pending: &PendingRequests,
     tx: &mpsc::UnboundedSender<Message>,
+    assistant_text: &Mutex<String>,
     text: &str,
     permission: PermissionPolicy,
     stream_events: bool,
@@ -344,7 +359,10 @@ async fn handle_inbound(
         let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
         let update = params.get("update").cloned().unwrap_or(Value::Null);
         if let Some(event) = events::compact_session_update(&session_id, &update) {
-            let _ = output::write_event(&event);
+            events::observe_assistant_text(&mut *assistant_text.lock().await, &event);
+            if stream_events {
+                let _ = output::write_event(&event);
+            }
         }
     }
 
