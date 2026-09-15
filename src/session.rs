@@ -58,11 +58,9 @@ pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
 pub fn config_status(
     session_id: &str,
     modes: Option<&acp::SessionModeState>,
-    config_options: Option<&[acp::SessionConfigOption]>,
+    raw: &Value,
 ) -> Value {
-    let options = config_options
-        .map(config_values)
-        .unwrap_or_else(|| json!({}));
+    let options = config_values_from_raw(raw);
     json!({
         "sessionId": session_id,
         "mode": modes.map(|state| state.current_mode_id.to_string()),
@@ -73,16 +71,21 @@ pub fn config_status(
     })
 }
 
-pub fn config_values(options: &[acp::SessionConfigOption]) -> Value {
+pub fn config_values_from_raw(raw: &Value) -> Value {
+    let items = raw
+        .get("configOptions")
+        .or_else(|| raw.get("config_options"))
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| raw.as_array().cloned())
+        .unwrap_or_default();
     let mut values = Map::new();
-    if let Ok(Value::Array(items)) = serde_json::to_value(options) {
-        for option in items {
-            let Some(id) = option.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            if let Some(current) = current_config_value(&option) {
-                values.insert(id.to_string(), current);
-            }
+    for option in items {
+        let Some(id) = option.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(current) = current_config_value(&option) {
+            values.insert(id.to_string(), current);
         }
     }
     Value::Object(values)
@@ -93,6 +96,8 @@ fn current_config_value(option: &Value) -> Option<Value> {
         .get("currentValue")
         .cloned()
         .or_else(|| option.get("value").cloned())
+        .or_else(|| option.pointer("/kind/currentValue").cloned())
+        .or_else(|| option.pointer("/select/currentValue").cloned())
         .filter(|value| !value.is_null())
 }
 
@@ -100,7 +105,6 @@ pub fn compact_inspect(
     session_id: &str,
     cwd: &Path,
     modes: Option<&acp::SessionModeState>,
-    config_options: Option<&[acp::SessionConfigOption]>,
     load_value: &Value,
     message_limit: Option<usize>,
     include_tools: bool,
@@ -115,7 +119,7 @@ pub fn compact_inspect(
     json!({
         "sessionId": session_id,
         "cwd": path_string(cwd),
-        "status": config_status(session_id, modes, config_options),
+        "status": config_status(session_id, modes, load_value),
         "messages": messages,
         "tools": if include_tools {
             Value::Array(compact_tools(snapshot))
@@ -370,7 +374,7 @@ mod tests {
                 }
             }
         });
-        let compact = compact_inspect("s1", Path::new("/repo"), None, None, &load, None, true);
+        let compact = compact_inspect("s1", Path::new("/repo"), None, &load, None, true);
         assert_eq!(compact["messages"][0]["role"], "user");
         assert_eq!(compact["messages"][0]["text"], "hello");
         assert_eq!(compact["tools"][0]["name"], "read");
@@ -400,5 +404,29 @@ mod tests {
         });
         assert!(matches_query_and_phase(&session, "build", Some("tools")));
         assert!(!matches_query_and_phase(&session, "build", Some("idle")));
+    }
+
+    #[test]
+    fn config_values_read_model_from_raw_select() {
+        let raw = json!({
+            "configOptions": [
+                {
+                    "id": "profile",
+                    "name": "Profile",
+                    "type": "select",
+                    "currentValue": "default"
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "type": "select",
+                    "currentValue": "xai/grok-4.5",
+                    "options": [{"value": "xai/grok-4.5", "name": "grok-4.5"}]
+                }
+            ]
+        });
+        let values = config_values_from_raw(&raw);
+        assert_eq!(values["profile"], "default");
+        assert_eq!(values["model"], "xai/grok-4.5");
     }
 }

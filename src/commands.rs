@@ -334,7 +334,7 @@ async fn new_session(
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
-    let created = client
+    let (created, created_raw) = client
         .new_session(cwd.clone(), profile.as_deref())
         .await
         .map_err(CliError::from_request)?;
@@ -346,7 +346,7 @@ async fn new_session(
             .await?
             .status
     } else {
-        status_from_new(&created)
+        session::config_status(&session_id, created.modes.as_ref(), &created_raw)
     };
     Ok(json!({
         "sessionId": session_id,
@@ -470,11 +470,10 @@ async fn inspect(
         return Err(CliError::rpc("agent does not support session/load"));
     }
     let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
-    let loaded = client
+    let (loaded, load_value) = client
         .load_session(session_id.clone(), cwd.clone())
         .await
         .map_err(CliError::from_request)?;
-    let load_value = serde_json::to_value(&loaded).map_err(CliError::rpc)?;
     if full {
         return Ok(json!({
             "sessionId": session_id,
@@ -482,7 +481,7 @@ async fn inspect(
             "status": session::config_status(
                 &session_id,
                 loaded.modes.as_ref(),
-                loaded.config_options.as_deref(),
+                &load_value,
             ),
             "raw": load_value,
         }));
@@ -491,7 +490,6 @@ async fn inspect(
         &session_id,
         &cwd,
         loaded.modes.as_ref(),
-        loaded.config_options.as_deref(),
         &load_value,
         messages,
         tools,
@@ -527,14 +525,17 @@ async fn set_model(
     model: String,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let response = client
+    let (_, raw) = client
         .set_config(session_id.clone(), "model", &model)
         .await
         .map_err(CliError::from_request)?;
     Ok(json!({
         "sessionId": session_id,
-        "model": model,
-        "config": session::config_values(&response.config_options),
+        "model": session::config_values_from_raw(&raw)
+            .get("model")
+            .cloned()
+            .unwrap_or(json!(model)),
+        "config": session::config_values_from_raw(&raw),
     }))
 }
 
@@ -544,14 +545,17 @@ async fn set_effort(
     effort: String,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let response = client
+    let (_, raw) = client
         .set_config(session_id.clone(), "reasoning_effort", &effort)
         .await
         .map_err(CliError::from_request)?;
     Ok(json!({
         "sessionId": session_id,
-        "reasoningEffort": effort,
-        "config": session::config_values(&response.config_options),
+        "reasoningEffort": session::config_values_from_raw(&raw)
+            .get("reasoning_effort")
+            .cloned()
+            .unwrap_or(json!(effort)),
+        "config": session::config_values_from_raw(&raw),
     }))
 }
 
@@ -584,7 +588,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     let (session_id, text) = parse_prompt_args(new, args)?;
     let text = read_prompt_text(text).map_err(CliError::rpc)?;
     let session_id = if new {
-        let created = client
+        let (created, _) = client
             .new_session(cwd.clone(), profile.as_deref())
             .await
             .map_err(CliError::from_request)?;
@@ -875,35 +879,19 @@ async fn open_session(
     cwd: PathBuf,
 ) -> Result<OpenedSession, CliError> {
     match client.resume_session(session_id.clone(), cwd.clone()).await {
-        Ok(response) => Ok(OpenedSession {
-            status: session::config_status(
-                &session_id,
-                response.modes.as_ref(),
-                response.config_options.as_deref(),
-            ),
+        Ok((response, raw)) => Ok(OpenedSession {
+            status: session::config_status(&session_id, response.modes.as_ref(), &raw),
         }),
         Err(_) => {
-            let loaded = client
+            let (loaded, raw) = client
                 .load_session(session_id.clone(), cwd)
                 .await
                 .map_err(CliError::from_request)?;
             Ok(OpenedSession {
-                status: session::config_status(
-                    &session_id,
-                    loaded.modes.as_ref(),
-                    loaded.config_options.as_deref(),
-                ),
+                status: session::config_status(&session_id, loaded.modes.as_ref(), &raw),
             })
         }
     }
-}
-
-fn status_from_new(response: &acp::NewSessionResponse) -> Value {
-    session::config_status(
-        &response.session_id.to_string(),
-        response.modes.as_ref(),
-        response.config_options.as_deref(),
-    )
 }
 
 fn extension_payload(response: &Value) -> Value {

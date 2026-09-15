@@ -130,12 +130,12 @@ impl AcpClient {
         &self,
         cwd: impl Into<std::path::PathBuf>,
         profile: Option<&str>,
-    ) -> Result<acp::NewSessionResponse> {
+    ) -> Result<(acp::NewSessionResponse, Value)> {
         let mut request = acp::NewSessionRequest::new(cwd.into());
         if let Some(profile_id) = profile {
             request = request.meta(crate::session::profile_meta(profile_id));
         }
-        self.request(request).await
+        self.request_json(request).await
     }
 
     pub async fn list_sessions(
@@ -157,8 +157,8 @@ impl AcpClient {
         &self,
         session_id: String,
         cwd: std::path::PathBuf,
-    ) -> Result<acp::LoadSessionResponse> {
-        self.request(acp::LoadSessionRequest::new(session_id, cwd))
+    ) -> Result<(acp::LoadSessionResponse, Value)> {
+        self.request_json(acp::LoadSessionRequest::new(session_id, cwd))
             .await
     }
 
@@ -166,8 +166,8 @@ impl AcpClient {
         &self,
         session_id: String,
         cwd: std::path::PathBuf,
-    ) -> Result<acp::ResumeSessionResponse> {
-        self.request(acp::ResumeSessionRequest::new(session_id, cwd))
+    ) -> Result<(acp::ResumeSessionResponse, Value)> {
+        self.request_json(acp::ResumeSessionRequest::new(session_id, cwd))
             .await
     }
 
@@ -190,8 +190,8 @@ impl AcpClient {
         session_id: String,
         config_id: &str,
         value: &str,
-    ) -> Result<acp::SetSessionConfigOptionResponse> {
-        self.request(acp::SetSessionConfigOptionRequest::new(
+    ) -> Result<(acp::SetSessionConfigOptionResponse, Value)> {
+        self.request_json(acp::SetSessionConfigOptionRequest::new(
             session_id,
             config_id.to_string(),
             value,
@@ -224,7 +224,15 @@ impl AcpClient {
         R: JsonRpcRequest + Send + Sync + 'static,
         R::Response: Send + 'static,
     {
-        self.request_with_timeout(request, REQUEST_TIMEOUT).await
+        Ok(self.request_with_json(request, REQUEST_TIMEOUT).await?.0)
+    }
+
+    pub async fn request_json<R>(&self, request: R) -> Result<(R::Response, Value)>
+    where
+        R: JsonRpcRequest + Send + Sync + 'static,
+        R::Response: Send + 'static,
+    {
+        self.request_with_json(request, REQUEST_TIMEOUT).await
     }
 
     async fn request_with_timeout<R>(&self, request: R, timeout: Duration) -> Result<R::Response>
@@ -232,10 +240,23 @@ impl AcpClient {
         R: JsonRpcRequest + Send + Sync + 'static,
         R::Response: Send + 'static,
     {
+        Ok(self.request_with_json(request, timeout).await?.0)
+    }
+
+    async fn request_with_json<R>(
+        &self,
+        request: R,
+        timeout: Duration,
+    ) -> Result<(R::Response, Value)>
+    where
+        R: JsonRpcRequest + Send + Sync + 'static,
+        R::Response: Send + 'static,
+    {
         let message = request.to_untyped_message()?;
         let method = message.method.clone();
         let result = self.request_raw(&method, message.params, timeout).await?;
-        Ok(R::Response::from_value(&method, result)?)
+        let typed = R::Response::from_value(&method, result.clone())?;
+        Ok((typed, result))
     }
 
     fn notify<N>(&self, notification: N) -> Result<()>
