@@ -60,7 +60,16 @@ pub fn config_status(
     modes: Option<&acp::SessionModeState>,
     raw: &Value,
 ) -> Value {
-    let options = config_values_from_raw(raw);
+    let mut options = match config_values_from_raw(raw) {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    if !options.contains_key("model")
+        && let Some(model) = model_from_snapshot(raw)
+    {
+        options.insert("model".to_string(), json!(model));
+    }
+    let options = Value::Object(options);
     json!({
         "sessionId": session_id,
         "mode": modes.map(|state| state.current_mode_id.to_string()),
@@ -68,6 +77,25 @@ pub fn config_status(
         "model": options.get("model").cloned(),
         "reasoningEffort": options.get("reasoning_effort").cloned(),
         "config": options,
+    })
+}
+
+pub fn model_from_snapshot(raw: &Value) -> Option<String> {
+    let events = session_load_snapshot(raw)
+        .and_then(|snapshot| snapshot.get("audit"))
+        .and_then(|audit| audit.get("events"))
+        .and_then(Value::as_array)?;
+    events.iter().rev().find_map(|event| {
+        let kind = event.get("kind")?;
+        if kind.get("type").and_then(Value::as_str) != Some("provider_changed") {
+            return None;
+        }
+        let data = kind.get("data")?;
+        let model = data.get("model").and_then(Value::as_str)?;
+        match data.get("provider").and_then(Value::as_str) {
+            Some(provider) if !provider.is_empty() => Some(format!("{provider}/{model}")),
+            _ => Some(model.to_string()),
+        }
     })
 }
 
@@ -428,6 +456,32 @@ mod tests {
             ]
         });
         assert_eq!(last_assistant_text(&inspect).as_deref(), Some("STEERED"));
+    }
+
+    #[test]
+    fn model_from_snapshot_uses_latest_provider_changed() {
+        let raw = json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {"kind": {"type": "provider_changed", "data": {
+                                "provider": "anthropic",
+                                "model": "claude-sonnet-4-5-20250929"
+                            }}},
+                            {"kind": {"type": "provider_changed", "data": {
+                                "provider": "xai",
+                                "model": "grok-4.5"
+                            }}}
+                        ]
+                    }
+                }
+            }
+        });
+        assert_eq!(model_from_snapshot(&raw).as_deref(), Some("xai/grok-4.5"));
+        let status = config_status("s1", None, &raw);
+        assert_eq!(status["model"], "xai/grok-4.5");
+        assert_eq!(status["config"]["model"], "xai/grok-4.5");
     }
 
     #[test]

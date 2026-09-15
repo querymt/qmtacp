@@ -371,14 +371,10 @@ async fn new_session(
         .await
         .map_err(CliError::from_request)?;
     let session_id = created.session_id.to_string();
-    let configured = mode.is_some() || model.is_some() || effort.is_some();
     apply_config(client, &session_id, mode, model, effort).await?;
-    let status = if configured {
-        open_session(client, session_id.clone(), cwd.clone())
-            .await?
-            .status
-    } else {
-        session::config_status(&session_id, created.modes.as_ref(), &created_raw)
+    let status = match open_session(client, session_id.clone(), cwd.clone()).await {
+        Ok(opened) => opened.status,
+        Err(_) => session::config_status(&session_id, created.modes.as_ref(), &created_raw),
     };
     Ok(json!({
         "sessionId": session_id,
@@ -1086,20 +1082,20 @@ async fn open_session(
     session_id: String,
     cwd: PathBuf,
 ) -> Result<OpenedSession, CliError> {
-    match client.resume_session(session_id.clone(), cwd.clone()).await {
-        Ok((response, raw)) => Ok(OpenedSession {
-            status: session::config_status(&session_id, response.modes.as_ref(), &raw),
-        }),
-        Err(_) => {
-            let (loaded, raw) = client
-                .load_session(session_id.clone(), cwd)
-                .await
-                .map_err(CliError::from_request)?;
-            Ok(OpenedSession {
-                status: session::config_status(&session_id, loaded.modes.as_ref(), &raw),
-            })
+    let resumed = client.resume_session(session_id.clone(), cwd.clone()).await;
+    if let Ok((response, raw)) = resumed {
+        let status = session::config_status(&session_id, response.modes.as_ref(), &raw);
+        if status.get("model").is_some_and(|value| !value.is_null()) {
+            return Ok(OpenedSession { status });
         }
     }
+    let (loaded, raw) = client
+        .load_session(session_id.clone(), cwd)
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(OpenedSession {
+        status: session::config_status(&session_id, loaded.modes.as_ref(), &raw),
+    })
 }
 
 fn extension_payload(response: &Value) -> Value {
