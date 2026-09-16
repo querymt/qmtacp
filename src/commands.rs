@@ -412,14 +412,14 @@ async fn sessions(
             .map_err(CliError::from_request)?;
         for item in page.sessions {
             sessions.push(session::session_summary(&item));
-            if sessions.len() >= limit {
-                return Ok(json!({
-                    "cwd": cwd,
-                    "sessions": sessions,
-                    "nextCursor": page.next_cursor,
-                    "truncated": page.next_cursor.is_some() || sessions.len() >= limit,
-                }));
-            }
+        }
+        if sessions.len() >= limit {
+            return Ok(json!({
+                "cwd": cwd,
+                "sessions": sessions,
+                "nextCursor": page.next_cursor,
+                "truncated": page.next_cursor.is_some(),
+            }));
         }
         match page.next_cursor {
             Some(cursor) if all => next = Some(cursor),
@@ -1082,20 +1082,25 @@ async fn open_session(
     session_id: String,
     cwd: PathBuf,
 ) -> Result<OpenedSession, CliError> {
-    let resumed = client.resume_session(session_id.clone(), cwd.clone()).await;
-    if let Ok((response, raw)) = resumed {
-        let status = session::config_status(&session_id, response.modes.as_ref(), &raw);
-        if status.get("model").is_some_and(|value| !value.is_null()) {
-            return Ok(OpenedSession { status });
+    let resumed_status = match client.resume_session(session_id.clone(), cwd.clone()).await {
+        Ok((response, raw)) => {
+            let status = session::config_status(&session_id, response.modes.as_ref(), &raw);
+            if status.get("model").is_some_and(|value| !value.is_null()) {
+                return Ok(OpenedSession { status });
+            }
+            Some(status)
         }
+        Err(_) => None,
+    };
+    match client.load_session(session_id.clone(), cwd).await {
+        Ok((loaded, raw)) => Ok(OpenedSession {
+            status: session::config_status(&session_id, loaded.modes.as_ref(), &raw),
+        }),
+        Err(err) => match resumed_status {
+            Some(status) => Ok(OpenedSession { status }),
+            None => Err(CliError::from_request(err)),
+        },
     }
-    let (loaded, raw) = client
-        .load_session(session_id.clone(), cwd)
-        .await
-        .map_err(CliError::from_request)?;
-    Ok(OpenedSession {
-        status: session::config_status(&session_id, loaded.modes.as_ref(), &raw),
-    })
 }
 
 fn extension_payload(response: &Value) -> Value {

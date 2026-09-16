@@ -22,7 +22,7 @@ cargo run -- set-mode SESSION_ID plan
 cargo run -- cancel SESSION_ID
 ```
 
-`prompt` streams compact NDJSON (`text`, `tool`, `mode`, `done`) and waits until
+`prompt` streams compact NDJSON (`text`, `tool`, `mode`, `plan`, `done`) and waits until
 the session is idle, including queued turns. `done` includes assembled assistant
 `text`. For an existing busy session, `--delivery auto` (default) steers if
 possible, otherwise queues. `follow SESSION` streams updates until idle. `exec`
