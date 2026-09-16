@@ -121,5 +121,8 @@ jobs:
       - name: Check Nix formatting
         run: nix run nixpkgs#alejandra -- --check .
 
+      - name: Build default package
+        run: nix build
+
       - name: Test in flake devShell
         run: nix develop --command cargo test --all-targets --all-features
