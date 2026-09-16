@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
 use crate::client::AcpClient;
@@ -12,7 +12,16 @@ use crate::error::{CliError, ExitCode};
 use crate::output;
 use crate::session;
 
-#[derive(Subcommand)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum Delivery {
+    #[default]
+    Auto,
+    Prompt,
+    Steer,
+    Queue,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum Command {
     /// Protocol version, agent info, ACP session features, and QueryMT capabilities.
     Caps,
@@ -22,6 +31,10 @@ pub enum Command {
     Models {
         #[arg(long)]
         refresh: bool,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Create a session.
     New {
@@ -45,6 +58,8 @@ pub enum Command {
         /// Follow nextCursor until exhausted or the page cap is reached.
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Client-side search over session/list pages.
     Find {
@@ -52,6 +67,8 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         query: Option<String>,
+        #[arg(long)]
+        phase: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
@@ -62,6 +79,10 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         full: bool,
+        #[arg(long)]
+        messages: Option<usize>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        tools: bool,
     },
     /// Current mode/model/profile/effort for a session.
     Status {
@@ -92,9 +113,54 @@ pub enum Command {
         effort: Option<String>,
         #[arg(long)]
         timeout: Option<u64>,
+        /// How to send text to an existing session.
+        #[arg(long, value_enum, default_value_t = Delivery::Auto)]
+        delivery: Delivery,
+        /// Wait until runtime is idle, including queued turns. Default true.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        until_idle: bool,
         /// `SESSION_ID TEXT` or, with --new, just `TEXT`. Use `-` to read stdin.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Current QueryMT runtime state for a session.
+    Runtime { session_id: String },
+    /// Stream compact session events until idle.
+    Follow {
+        session_id: String,
+        #[arg(long, default_value_t = 1)]
+        interval: u64,
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// Poll runtime state until idle or timeout.
+    Watch {
+        session_id: String,
+        #[arg(long, default_value_t = 1)]
+        interval: u64,
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        idle: bool,
+    },
+    /// Steer an in-flight turn.
+    Steer {
+        session_id: String,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
+    /// Queue input for after the current turn.
+    Queue {
+        session_id: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
+    /// Run multiple commands on one connection. Lines from stdin or remaining args.
+    Exec {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        commands: Vec<String>,
     },
     /// Cancel the current turn for a session.
     Cancel { session_id: String },
@@ -114,7 +180,11 @@ pub async fn run(
     match command {
         Command::Caps => write_ok(pretty, caps(client).await?),
         Command::Profiles => write_ok(pretty, profiles(client).await?),
-        Command::Models { refresh } => write_ok(pretty, models(client, refresh).await?),
+        Command::Models {
+            refresh,
+            query,
+            provider,
+        } => write_ok(pretty, models(client, refresh, query, provider).await?),
         Command::New {
             cwd,
             profile,
@@ -125,17 +195,28 @@ pub async fn run(
             pretty,
             new_session(client, cwd, profile, mode, model, effort).await?,
         ),
-        Command::Sessions { cwd, cursor, all } => {
-            write_ok(pretty, sessions(client, cwd, cursor, all).await?)
-        }
-        Command::Find { cwd, query, limit } => {
-            write_ok(pretty, find(client, cwd, query, limit).await?)
-        }
+        Command::Sessions {
+            cwd,
+            cursor,
+            all,
+            limit,
+        } => write_ok(pretty, sessions(client, cwd, cursor, all, limit).await?),
+        Command::Find {
+            cwd,
+            query,
+            phase,
+            limit,
+        } => write_ok(pretty, find(client, cwd, query, phase, limit).await?),
         Command::Inspect {
             session_id,
             cwd,
             full,
-        } => write_ok(pretty, inspect(client, session_id, cwd, full).await?),
+            messages,
+            tools,
+        } => write_ok(
+            pretty,
+            inspect(client, session_id, cwd, full, messages, tools).await?,
+        ),
         Command::Status { session_id, cwd } => {
             write_ok(pretty, status(client, session_id, cwd).await?)
         }
@@ -156,6 +237,8 @@ pub async fn run(
             model,
             effort,
             timeout,
+            delivery,
+            until_idle,
             args,
         } => {
             prompt(
@@ -168,12 +251,39 @@ pub async fn run(
                     model,
                     effort,
                     timeout,
+                    delivery,
+                    until_idle,
                     args,
                     pretty,
                 },
             )
             .await
         }
+        Command::Runtime { session_id } => write_ok(pretty, runtime(client, session_id).await?),
+        Command::Follow {
+            session_id,
+            interval,
+            timeout,
+        } => follow(client, session_id, interval, timeout, pretty).await,
+        Command::Watch {
+            session_id,
+            interval,
+            timeout,
+            idle,
+        } => watch(client, session_id, interval, timeout, idle, pretty).await,
+        Command::Steer {
+            session_id,
+            run_id,
+            text,
+        } => write_ok(
+            pretty,
+            submit_input(client, "querymt/session/steer", session_id, run_id, text).await?,
+        ),
+        Command::Queue { session_id, text } => write_ok(
+            pretty,
+            submit_input(client, "querymt/session/queue", session_id, None, text).await?,
+        ),
+        Command::Exec { commands } => exec(client, commands, pretty).await,
         Command::Cancel { session_id } => write_ok(pretty, cancel(client, session_id).await?),
         Command::Close { session_id } => write_ok(pretty, close(client, session_id).await?),
     }
@@ -220,7 +330,12 @@ async fn profiles(client: &AcpClient) -> Result<Value, CliError> {
     Ok(extension_payload(&response))
 }
 
-async fn models(client: &AcpClient, refresh: bool) -> Result<Value, CliError> {
+async fn models(
+    client: &AcpClient,
+    refresh: bool,
+    query: Option<String>,
+    provider: Option<String>,
+) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let (method, params) = if refresh {
         (
@@ -234,7 +349,11 @@ async fn models(client: &AcpClient, refresh: bool) -> Result<Value, CliError> {
         .extension(method, params)
         .await
         .map_err(CliError::from_request)?;
-    Ok(extension_payload(&response))
+    Ok(session::filter_models(
+        extension_payload(&response),
+        query.as_deref(),
+        provider.as_deref(),
+    ))
 }
 
 async fn new_session(
@@ -247,19 +366,15 @@ async fn new_session(
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
-    let created = client
+    let (created, created_raw) = client
         .new_session(cwd.clone(), profile.as_deref())
         .await
         .map_err(CliError::from_request)?;
     let session_id = created.session_id.to_string();
-    let configured = mode.is_some() || model.is_some() || effort.is_some();
     apply_config(client, &session_id, mode, model, effort).await?;
-    let status = if configured {
-        open_session(client, session_id.clone(), cwd.clone())
-            .await?
-            .status
-    } else {
-        status_from_new(&created)
+    let status = match open_session(client, session_id.clone(), cwd.clone()).await {
+        Ok(opened) => opened.status,
+        Err(_) => session::config_status(&session_id, created.modes.as_ref(), &created_raw),
     };
     Ok(json!({
         "sessionId": session_id,
@@ -273,37 +388,47 @@ async fn sessions(
     cwd: Option<PathBuf>,
     cursor: Option<String>,
     all: bool,
+    limit: Option<usize>,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_optional_cwd(cwd).map_err(CliError::rpc)?;
-    if !all {
-        let page = client
-            .list_sessions(cwd.clone(), cursor)
-            .await
-            .map_err(CliError::from_request)?;
-        return Ok(list_page(cwd, &page));
-    }
-
+    let limit = limit.unwrap_or(if all { usize::MAX } else { 20 }).max(1);
     let mut sessions = Vec::new();
     let mut next = cursor;
     let mut pages = 0usize;
     loop {
         pages += 1;
         if pages > session::find_page_cap() {
-            bail_rpc("session list exceeded page cap")?;
+            return Ok(json!({
+                "cwd": cwd,
+                "sessions": sessions,
+                "nextCursor": next,
+                "truncated": true,
+            }));
         }
         let page = client
             .list_sessions(cwd.clone(), next.clone())
             .await
             .map_err(CliError::from_request)?;
-        sessions.extend(page.sessions.iter().map(session::session_summary));
-        match page.next_cursor.clone() {
-            Some(cursor) => next = Some(cursor),
-            None => {
+        for item in page.sessions {
+            sessions.push(session::session_summary(&item));
+        }
+        if sessions.len() >= limit {
+            return Ok(json!({
+                "cwd": cwd,
+                "sessions": sessions,
+                "nextCursor": page.next_cursor,
+                "truncated": page.next_cursor.is_some(),
+            }));
+        }
+        match page.next_cursor {
+            Some(cursor) if all => next = Some(cursor),
+            next_cursor => {
                 return Ok(json!({
                     "cwd": cwd,
                     "sessions": sessions,
-                    "nextCursor": Value::Null,
+                    "nextCursor": next_cursor,
+                    "truncated": false,
                 }));
             }
         }
@@ -314,6 +439,7 @@ async fn find(
     client: &AcpClient,
     cwd: Option<PathBuf>,
     query: Option<String>,
+    phase: Option<String>,
     limit: usize,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
@@ -332,13 +458,14 @@ async fn find(
             .list_sessions(cwd.clone(), next.clone())
             .await
             .map_err(CliError::from_request)?;
-        for session in page.sessions {
-            let summary = session::session_summary(&session);
-            if session::matches_query(&summary, &query) {
+        for listed in page.sessions {
+            let summary = session::session_summary(&listed);
+            if session::matches_query_and_phase(&summary, &query, phase.as_deref()) {
                 matches.push(summary);
                 if matches.len() >= limit {
                     return Ok(json!({
                         "query": query,
+                        "phase": phase,
                         "cwd": cwd,
                         "sessions": matches,
                     }));
@@ -352,6 +479,7 @@ async fn find(
     }
     Ok(json!({
         "query": query,
+        "phase": phase,
         "cwd": cwd,
         "sessions": matches,
     }))
@@ -362,17 +490,18 @@ async fn inspect(
     session_id: String,
     cwd: Option<PathBuf>,
     full: bool,
+    messages: Option<usize>,
+    tools: bool,
 ) -> Result<Value, CliError> {
     let initialized = client.initialize().await.map_err(CliError::from_request)?;
     if !initialized.agent_capabilities.load_session {
         return Err(CliError::rpc("agent does not support session/load"));
     }
     let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
-    let loaded = client
+    let (loaded, load_value) = client
         .load_session(session_id.clone(), cwd.clone())
         .await
         .map_err(CliError::from_request)?;
-    let load_value = serde_json::to_value(&loaded).map_err(CliError::rpc)?;
     if full {
         return Ok(json!({
             "sessionId": session_id,
@@ -380,7 +509,7 @@ async fn inspect(
             "status": session::config_status(
                 &session_id,
                 loaded.modes.as_ref(),
-                loaded.config_options.as_deref(),
+                &load_value,
             ),
             "raw": load_value,
         }));
@@ -389,8 +518,9 @@ async fn inspect(
         &session_id,
         &cwd,
         loaded.modes.as_ref(),
-        loaded.config_options.as_deref(),
         &load_value,
+        messages,
+        tools,
     ))
 }
 
@@ -423,14 +553,17 @@ async fn set_model(
     model: String,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let response = client
+    let (_, raw) = client
         .set_config(session_id.clone(), "model", &model)
         .await
         .map_err(CliError::from_request)?;
     Ok(json!({
         "sessionId": session_id,
-        "model": model,
-        "config": session::config_values(&response.config_options),
+        "model": session::config_values_from_raw(&raw)
+            .get("model")
+            .cloned()
+            .unwrap_or(json!(model)),
+        "config": session::config_values_from_raw(&raw),
     }))
 }
 
@@ -440,14 +573,17 @@ async fn set_effort(
     effort: String,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let response = client
+    let (_, raw) = client
         .set_config(session_id.clone(), "reasoning_effort", &effort)
         .await
         .map_err(CliError::from_request)?;
     Ok(json!({
         "sessionId": session_id,
-        "reasoningEffort": effort,
-        "config": session::config_values(&response.config_options),
+        "reasoningEffort": session::config_values_from_raw(&raw)
+            .get("reasoning_effort")
+            .cloned()
+            .unwrap_or(json!(effort)),
+        "config": session::config_values_from_raw(&raw),
     }))
 }
 
@@ -459,6 +595,8 @@ struct PromptArgs {
     model: Option<String>,
     effort: Option<String>,
     timeout: Option<u64>,
+    delivery: Delivery,
+    until_idle: bool,
     args: Vec<String>,
     pretty: bool,
 }
@@ -472,6 +610,8 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         model,
         effort,
         timeout,
+        delivery,
+        until_idle,
         args,
         pretty,
     } = args;
@@ -480,7 +620,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     let (session_id, text) = parse_prompt_args(new, args)?;
     let text = read_prompt_text(text).map_err(CliError::rpc)?;
     let session_id = if new {
-        let created = client
+        let (created, _) = client
             .new_session(cwd.clone(), profile.as_deref())
             .await
             .map_err(CliError::from_request)?;
@@ -495,24 +635,88 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         session_id
     };
     apply_config(client, &session_id, mode, model, effort).await?;
+    let chosen = if new {
+        Delivery::Prompt
+    } else {
+        choose_delivery(client, &session_id, delivery).await?
+    };
     output::write_event(&json!({
         "type": "session",
         "sessionId": session_id,
         "cwd": cwd,
+        "delivery": delivery_name(chosen),
     }))
     .map_err(CliError::rpc)?;
+    let _ = client.take_assistant_text().await;
 
     let timeout = timeout.map(Duration::from_secs);
-    let response = client
-        .prompt(session_id.clone(), text, timeout)
+    let stop_reason = match chosen {
+        Delivery::Prompt => {
+            let response = client
+                .prompt(session_id.clone(), text, timeout)
+                .await
+                .map_err(CliError::from_request)?;
+            stop_reason_name(&response.stop_reason)
+        }
+        Delivery::Steer => {
+            submit_input(
+                client,
+                "querymt/session/steer",
+                session_id.clone(),
+                None,
+                vec![text],
+            )
+            .await?;
+            "steered".to_string()
+        }
+        Delivery::Queue => {
+            submit_input(
+                client,
+                "querymt/session/queue",
+                session_id.clone(),
+                None,
+                vec![text],
+            )
+            .await?;
+            "queued".to_string()
+        }
+        Delivery::Auto => unreachable!("auto is resolved before send"),
+    };
+
+    let mut text = client.take_assistant_text().await;
+    if until_idle {
+        wait_until_idle(
+            client,
+            &session_id,
+            timeout.unwrap_or(Duration::from_secs(120)),
+        )
+        .await?;
+        let more = client.snapshot_assistant_text().await;
+        if !more.is_empty() {
+            text = more;
+        }
+        if let Ok(inspected) = inspect(
+            client,
+            session_id.clone(),
+            Some(cwd.clone()),
+            false,
+            Some(12),
+            false,
+        )
         .await
-        .map_err(CliError::from_request)?;
-    let stop_reason = stop_reason_name(&response.stop_reason);
+            && let Some(last) = session::last_assistant_text(&inspected)
+        {
+            text = last;
+        }
+    }
+
     let done = json!({
         "type": "done",
         "ok": true,
         "sessionId": session_id,
+        "delivery": delivery_name(chosen),
         "stopReason": stop_reason,
+        "text": text,
         "loadSession": initialized.agent_capabilities.load_session,
     });
     if pretty {
@@ -523,6 +727,277 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     Ok(CommandOutcome {
         exit: output::exit_for_stop_reason(&stop_reason),
     })
+}
+
+fn delivery_name(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Auto => "auto",
+        Delivery::Prompt => "prompt",
+        Delivery::Steer => "steer",
+        Delivery::Queue => "queue",
+    }
+}
+
+async fn choose_delivery(
+    client: &AcpClient,
+    session_id: &str,
+    requested: Delivery,
+) -> Result<Delivery, CliError> {
+    if requested != Delivery::Auto {
+        return Ok(requested);
+    }
+    let state = runtime(client, session_id.to_string()).await?;
+    let phase = state
+        .pointer("/runtime/phase")
+        .and_then(Value::as_str)
+        .unwrap_or("idle");
+    let steerable = state
+        .pointer("/runtime/steerable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(delivery_from_runtime(phase, steerable))
+}
+
+fn delivery_from_runtime(phase: &str, steerable: bool) -> Delivery {
+    if phase == "idle" {
+        Delivery::Prompt
+    } else if steerable {
+        Delivery::Steer
+    } else {
+        Delivery::Queue
+    }
+}
+
+async fn wait_until_idle(
+    client: &AcpClient,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<(), CliError> {
+    wait_until_idle_every(client, session_id, timeout, Duration::from_millis(400)).await
+}
+
+async fn wait_until_idle_every(
+    client: &AcpClient,
+    session_id: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(), CliError> {
+    let deadline = tokio::time::Instant::now() + timeout.max(Duration::from_secs(1));
+    loop {
+        let value = runtime(client, session_id.to_string()).await?;
+        let phase = value
+            .pointer("/runtime/phase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if phase == "idle" {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CliError::Timeout(format!(
+                "timed out after {}s while session {session_id} was {phase}",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(interval.max(Duration::from_millis(200))).await;
+    }
+}
+
+async fn follow(
+    client: &AcpClient,
+    session_id: String,
+    interval: u64,
+    timeout: u64,
+    pretty: bool,
+) -> Result<CommandOutcome, CliError> {
+    client.initialize().await.map_err(CliError::from_request)?;
+    let cwd = session::resolve_cwd(None).map_err(CliError::rpc)?;
+    let _ = open_session(client, session_id.clone(), cwd).await;
+    let _ = client.take_assistant_text().await;
+    wait_until_idle_every(
+        client,
+        &session_id,
+        Duration::from_secs(timeout.max(1)),
+        Duration::from_secs(interval.max(1)),
+    )
+    .await?;
+    let text = client.take_assistant_text().await;
+    let done = json!({
+        "type": "done",
+        "ok": true,
+        "sessionId": session_id,
+        "stopReason": "idle",
+        "text": text,
+        "interval": interval,
+    });
+    if pretty {
+        output::write_json(&done, true).map_err(CliError::rpc)?;
+    } else {
+        output::write_event(&done).map_err(CliError::rpc)?;
+    }
+    Ok(CommandOutcome { exit: ExitCode::Ok })
+}
+
+async fn runtime(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
+    client.initialize().await.map_err(CliError::from_request)?;
+    let response = client
+        .extension(
+            "querymt/session/runtimeState",
+            json!({ "session_id": session_id }),
+        )
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(json!({
+        "sessionId": session_id,
+        "runtime": extension_payload(&response),
+    }))
+}
+
+async fn watch(
+    client: &AcpClient,
+    session_id: String,
+    interval: u64,
+    timeout: u64,
+    wait_idle: bool,
+    pretty: bool,
+) -> Result<CommandOutcome, CliError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout.max(1));
+    let interval = Duration::from_secs(interval.max(1));
+    loop {
+        let value = runtime(client, session_id.clone()).await?;
+        let phase = value
+            .pointer("/runtime/phase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        output::write_event(&json!({
+            "type": "runtime",
+            "sessionId": session_id,
+            "phase": phase,
+            "runtime": value.get("runtime"),
+        }))
+        .map_err(CliError::rpc)?;
+        if !wait_idle || phase == "idle" {
+            return write_ok(pretty, value);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CliError::Timeout(format!(
+                "watch timed out after {timeout}s while session {session_id} was {phase}"
+            )));
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn submit_input(
+    client: &AcpClient,
+    method: &str,
+    session_id: String,
+    run_id: Option<String>,
+    text: Vec<String>,
+) -> Result<Value, CliError> {
+    client.initialize().await.map_err(CliError::from_request)?;
+    let text =
+        join_prompt_args(text).ok_or_else(|| CliError::Usage(format!("{method} requires TEXT")))?;
+    let run_id = if method.ends_with("/steer") && run_id.is_none() {
+        runtime(client, session_id.clone())
+            .await?
+            .pointer("/runtime/active_run_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    } else {
+        run_id
+    };
+    let mut params = json!({
+        "session_id": session_id,
+        "prompt": [{ "type": "text", "text": text }],
+    });
+    if let Some(run_id) = run_id {
+        params
+            .as_object_mut()
+            .expect("params object")
+            .insert("expected_run_id".to_string(), json!(run_id));
+    }
+    let response = client
+        .extension(method, params)
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(json!({
+        "sessionId": session_id,
+        "result": extension_payload(&response),
+    }))
+}
+
+async fn exec(
+    client: &AcpClient,
+    commands: Vec<String>,
+    pretty: bool,
+) -> Result<CommandOutcome, CliError> {
+    let lines = if commands.is_empty() {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(CliError::rpc)?;
+        buf.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        commands
+    };
+    if lines.is_empty() {
+        return Err(CliError::Usage(
+            "exec requires commands on stdin or as arguments".into(),
+        ));
+    }
+    let mut last = CommandOutcome { exit: ExitCode::Ok };
+    for line in lines {
+        let command = parse_exec_line(&line)?;
+        last = Box::pin(run(client, command, pretty)).await?;
+        if last.exit != ExitCode::Ok {
+            return Ok(last);
+        }
+    }
+    Ok(last)
+}
+
+#[derive(Parser)]
+#[command(name = "qmtacp")]
+struct ExecLine {
+    #[command(subcommand)]
+    command: Command,
+}
+
+fn parse_exec_line(line: &str) -> Result<Command, CliError> {
+    let args = split_exec_args(line);
+    let mut argv = vec!["qmtacp".to_string()];
+    argv.extend(args);
+    ExecLine::try_parse_from(&argv)
+        .map(|cli| cli.command)
+        .map_err(|err| CliError::Usage(err.to_string()))
+}
+
+fn split_exec_args(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None::<char>;
+    for ch in line.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => current.push(c),
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
 }
 
 async fn cancel(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
@@ -607,44 +1082,25 @@ async fn open_session(
     session_id: String,
     cwd: PathBuf,
 ) -> Result<OpenedSession, CliError> {
-    match client.resume_session(session_id.clone(), cwd.clone()).await {
-        Ok(response) => Ok(OpenedSession {
-            status: session::config_status(
-                &session_id,
-                response.modes.as_ref(),
-                response.config_options.as_deref(),
-            ),
-        }),
-        Err(_) => {
-            let loaded = client
-                .load_session(session_id.clone(), cwd)
-                .await
-                .map_err(CliError::from_request)?;
-            Ok(OpenedSession {
-                status: session::config_status(
-                    &session_id,
-                    loaded.modes.as_ref(),
-                    loaded.config_options.as_deref(),
-                ),
-            })
+    let resumed_status = match client.resume_session(session_id.clone(), cwd.clone()).await {
+        Ok((response, raw)) => {
+            let status = session::config_status(&session_id, response.modes.as_ref(), &raw);
+            if status.get("model").is_some_and(|value| !value.is_null()) {
+                return Ok(OpenedSession { status });
+            }
+            Some(status)
         }
+        Err(_) => None,
+    };
+    match client.load_session(session_id.clone(), cwd).await {
+        Ok((loaded, raw)) => Ok(OpenedSession {
+            status: session::config_status(&session_id, loaded.modes.as_ref(), &raw),
+        }),
+        Err(err) => match resumed_status {
+            Some(status) => Ok(OpenedSession { status }),
+            None => Err(CliError::from_request(err)),
+        },
     }
-}
-
-fn status_from_new(response: &acp::NewSessionResponse) -> Value {
-    session::config_status(
-        &response.session_id.to_string(),
-        response.modes.as_ref(),
-        response.config_options.as_deref(),
-    )
-}
-
-fn list_page(cwd: Option<PathBuf>, page: &acp::ListSessionsResponse) -> Value {
-    json!({
-        "cwd": cwd,
-        "sessions": page.sessions.iter().map(session::session_summary).collect::<Vec<_>>(),
-        "nextCursor": page.next_cursor,
-    })
 }
 
 fn extension_payload(response: &Value) -> Value {
@@ -688,10 +1144,6 @@ fn stop_reason_name(reason: &acp::StopReason) -> String {
     }
 }
 
-fn bail_rpc(message: &str) -> Result<Value, CliError> {
-    Err(CliError::rpc(message))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,6 +1169,47 @@ mod tests {
         assert!(matches!(
             parse_prompt_args(false, Vec::new()),
             Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn exec_line_parses_nested_command() {
+        let command = parse_exec_line("sessions --cwd /tmp --limit 5").unwrap();
+        match command {
+            Command::Sessions { limit, .. } => assert_eq!(limit, Some(5)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_exec_args_keeps_quoted_text() {
+        assert_eq!(
+            split_exec_args(r#"prompt --new "fix the build""#),
+            vec!["prompt", "--new", "fix the build"]
+        );
+    }
+
+    #[test]
+    fn auto_delivery_is_prompt_when_idle() {
+        assert!(matches!(
+            delivery_from_runtime("idle", false),
+            Delivery::Prompt
+        ));
+    }
+
+    #[test]
+    fn auto_delivery_steers_when_steerable() {
+        assert!(matches!(
+            delivery_from_runtime("tools", true),
+            Delivery::Steer
+        ));
+    }
+
+    #[test]
+    fn auto_delivery_queues_when_busy_and_not_steerable() {
+        assert!(matches!(
+            delivery_from_runtime("closing", false),
+            Delivery::Queue
         ));
     }
 }

@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod error;
+mod events;
 mod output;
 mod policy;
 mod session;
@@ -37,6 +38,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = PermissionPolicy::AllowOnce)]
     permission: PermissionPolicy,
 
+    /// Do not print connection logs to stderr.
+    #[arg(long)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -61,10 +66,15 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     )
     .map_err(|err| CliError::Usage(err.to_string()))?;
     let endpoint = safe_endpoint_label(&url).map_err(|err| CliError::Usage(err.to_string()))?;
-    let stream_events = matches!(cli.command, Command::Prompt { .. });
-    eprintln!("connecting {endpoint}");
+    let stream_events = matches!(
+        cli.command,
+        Command::Prompt { .. } | Command::Exec { .. } | Command::Follow { .. }
+    );
+    if !cli.quiet {
+        eprintln!("connecting {endpoint}");
+    }
     let client = AcpClient::connect(&url, &endpoint, cli.permission, stream_events)
         .await
-        .map_err(CliError::connection)?;
+        .map_err(|err| CliError::connection_with_cause(&endpoint, err))?;
     Ok(commands::run(&client, cli.command, cli.pretty).await?.exit)
 }

@@ -30,10 +30,6 @@ pub enum CliError {
 }
 
 impl CliError {
-    pub fn connection(error: impl ToString) -> Self {
-        Self::Connection(error.to_string())
-    }
-
     pub fn rpc(error: impl ToString) -> Self {
         Self::Rpc(error.to_string())
     }
@@ -42,11 +38,28 @@ impl CliError {
         let message = format!("{error:#}");
         if message.contains("timed out") {
             Self::Timeout(message)
-        } else if message.contains("connect ") {
+        } else if message.contains("connect ")
+            || message.contains("Connection refused")
+            || message.contains("Network is unreachable")
+            || message.contains("Name or service not known")
+            || message.contains("WebSocket")
+        {
             Self::Connection(message)
         } else {
             Self::Rpc(message)
         }
+    }
+
+    pub fn connection_with_cause(endpoint: &str, error: impl std::fmt::Display) -> Self {
+        let message = error.to_string();
+        let hint = if message.contains("Connection refused") {
+            "; is qmtcode --acp-ws running? loopback is 127.0.0.1, not 172.0.0.1"
+        } else if message.contains("timed out") {
+            "; connection timed out"
+        } else {
+            ""
+        };
+        Self::Connection(format!("connect {endpoint}: {message}{hint}"))
     }
 
     pub fn exit_code(&self) -> ExitCode {

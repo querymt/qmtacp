@@ -34,23 +34,42 @@ pub fn profile_meta(profile_id: &str) -> Map<String, Value> {
 }
 
 pub fn session_summary(session: &acp::SessionInfo) -> Value {
+    compact_session_summary(session)
+}
+
+pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
+    let meta = session
+        .meta
+        .as_ref()
+        .and_then(|meta| serde_json::to_value(meta).ok())
+        .unwrap_or(Value::Null);
+    let runtime = meta.get("runtimeStatus").cloned().unwrap_or(Value::Null);
     json!({
         "sessionId": session.session_id.to_string(),
         "cwd": path_string(&session.cwd),
         "title": session.title,
         "updatedAt": session.updated_at,
-        "meta": session.meta,
+        "phase": runtime.get("phase").cloned(),
+        "messageCount": meta.get("messageCount").cloned(),
+        "runtime": runtime,
     })
 }
 
 pub fn config_status(
     session_id: &str,
     modes: Option<&acp::SessionModeState>,
-    config_options: Option<&[acp::SessionConfigOption]>,
+    raw: &Value,
 ) -> Value {
-    let options = config_options
-        .map(config_values)
-        .unwrap_or_else(|| json!({}));
+    let mut options = match config_values_from_raw(raw) {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    if !options.contains_key("model")
+        && let Some(model) = model_from_snapshot(raw)
+    {
+        options.insert("model".to_string(), json!(model));
+    }
+    let options = Value::Object(options);
     json!({
         "sessionId": session_id,
         "mode": modes.map(|state| state.current_mode_id.to_string()),
@@ -61,16 +80,40 @@ pub fn config_status(
     })
 }
 
-pub fn config_values(options: &[acp::SessionConfigOption]) -> Value {
+pub fn model_from_snapshot(raw: &Value) -> Option<String> {
+    let events = session_load_snapshot(raw)
+        .and_then(|snapshot| snapshot.get("audit"))
+        .and_then(|audit| audit.get("events"))
+        .and_then(Value::as_array)?;
+    events.iter().rev().find_map(|event| {
+        let kind = event.get("kind")?;
+        if kind.get("type").and_then(Value::as_str) != Some("provider_changed") {
+            return None;
+        }
+        let data = kind.get("data")?;
+        let model = data.get("model").and_then(Value::as_str)?;
+        match data.get("provider").and_then(Value::as_str) {
+            Some(provider) if !provider.is_empty() => Some(format!("{provider}/{model}")),
+            _ => Some(model.to_string()),
+        }
+    })
+}
+
+pub fn config_values_from_raw(raw: &Value) -> Value {
+    let items = raw
+        .get("configOptions")
+        .or_else(|| raw.get("config_options"))
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| raw.as_array().cloned())
+        .unwrap_or_default();
     let mut values = Map::new();
-    if let Ok(Value::Array(items)) = serde_json::to_value(options) {
-        for option in items {
-            let Some(id) = option.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            if let Some(current) = current_config_value(&option) {
-                values.insert(id.to_string(), current);
-            }
+    for option in items {
+        let Some(id) = option.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(current) = current_config_value(&option) {
+            values.insert(id.to_string(), current);
         }
     }
     Value::Object(values)
@@ -81,6 +124,8 @@ fn current_config_value(option: &Value) -> Option<Value> {
         .get("currentValue")
         .cloned()
         .or_else(|| option.get("value").cloned())
+        .or_else(|| option.pointer("/kind/currentValue").cloned())
+        .or_else(|| option.pointer("/select/currentValue").cloned())
         .filter(|value| !value.is_null())
 }
 
@@ -88,16 +133,27 @@ pub fn compact_inspect(
     session_id: &str,
     cwd: &Path,
     modes: Option<&acp::SessionModeState>,
-    config_options: Option<&[acp::SessionConfigOption]>,
     load_value: &Value,
+    message_limit: Option<usize>,
+    include_tools: bool,
 ) -> Value {
     let snapshot = session_load_snapshot(load_value);
+    let mut messages = compact_messages(snapshot);
+    if let Some(limit) = message_limit.filter(|limit| *limit > 0)
+        && messages.len() > limit
+    {
+        messages = messages.split_off(messages.len() - limit);
+    }
     json!({
         "sessionId": session_id,
         "cwd": path_string(cwd),
-        "status": config_status(session_id, modes, config_options),
-        "messages": compact_messages(snapshot),
-        "tools": compact_tools(snapshot),
+        "status": config_status(session_id, modes, load_value),
+        "messages": messages,
+        "tools": if include_tools {
+            Value::Array(compact_tools(snapshot))
+        } else {
+            Value::Array(Vec::new())
+        },
         "errors": compact_errors(snapshot),
     })
 }
@@ -208,12 +264,27 @@ fn compact_errors(snapshot: Option<&Value>) -> Vec<Value> {
         .collect()
 }
 
-pub fn matches_query(session: &Value, query: &str) -> bool {
+pub fn matches_query_and_phase(session: &Value, query: &str, phase: Option<&str>) -> bool {
+    if let Some(phase) = phase {
+        let current = session
+            .get("phase")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                session
+                    .get("runtime")
+                    .and_then(|runtime| runtime.get("phase"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("");
+        if !current.eq_ignore_ascii_case(phase) {
+            return false;
+        }
+    }
     let query = query.to_ascii_lowercase();
     if query.is_empty() {
         return true;
     }
-    for key in ["sessionId", "title", "cwd"] {
+    for key in ["sessionId", "title", "cwd", "phase"] {
         if session
             .get(key)
             .and_then(Value::as_str)
@@ -225,8 +296,46 @@ pub fn matches_query(session: &Value, query: &str) -> bool {
     false
 }
 
+pub fn filter_models(payload: Value, query: Option<&str>, provider: Option<&str>) -> Value {
+    let mut root = payload;
+    let Some(models) = root.get_mut("models").and_then(Value::as_array_mut) else {
+        return root;
+    };
+    models.retain(|model| {
+        let provider_ok = provider.is_none_or(|wanted| {
+            model
+                .get("provider")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(wanted))
+        });
+        let query_ok = query.is_none_or(|wanted| {
+            let wanted = wanted.to_ascii_lowercase();
+            ["id", "label", "model", "provider"].iter().any(|key| {
+                model
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&wanted))
+            })
+        });
+        provider_ok && query_ok
+    });
+    root
+}
+
 pub fn find_page_cap() -> usize {
     FIND_PAGE_CAP
+}
+
+pub fn last_assistant_text(inspect: &Value) -> Option<String> {
+    inspect
+        .get("messages")
+        .and_then(Value::as_array)?
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|message| message.get("text").and_then(Value::as_str))
+        .map(str::to_string)
+        .filter(|text| !text.is_empty())
 }
 
 fn path_string(path: &Path) -> String {
@@ -305,7 +414,7 @@ mod tests {
                 }
             }
         });
-        let compact = compact_inspect("s1", Path::new("/repo"), None, None, &load);
+        let compact = compact_inspect("s1", Path::new("/repo"), None, &load, None, true);
         assert_eq!(compact["messages"][0]["role"], "user");
         assert_eq!(compact["messages"][0]["text"], "hello");
         assert_eq!(compact["tools"][0]["name"], "read");
@@ -319,9 +428,83 @@ mod tests {
             "title": "Fix build",
             "cwd": "/tmp/project"
         });
-        assert!(matches_query(&session, "abc"));
-        assert!(matches_query(&session, "build"));
-        assert!(matches_query(&session, "project"));
-        assert!(!matches_query(&session, "missing"));
+        assert!(matches_query_and_phase(&session, "abc", None));
+        assert!(matches_query_and_phase(&session, "build", None));
+        assert!(matches_query_and_phase(&session, "project", None));
+        assert!(!matches_query_and_phase(&session, "missing", None));
+    }
+
+    #[test]
+    fn find_can_filter_by_phase() {
+        let session = json!({
+            "sessionId": "abc-123",
+            "title": "Fix build",
+            "cwd": "/tmp/project",
+            "phase": "tools"
+        });
+        assert!(matches_query_and_phase(&session, "build", Some("tools")));
+        assert!(!matches_query_and_phase(&session, "build", Some("idle")));
+    }
+
+    #[test]
+    fn last_assistant_text_uses_newest_assistant_message() {
+        let inspect = json!({
+            "messages": [
+                {"role":"user","text":"hi"},
+                {"role":"assistant","text":"first"},
+                {"role":"assistant","text":"STEERED"}
+            ]
+        });
+        assert_eq!(last_assistant_text(&inspect).as_deref(), Some("STEERED"));
+    }
+
+    #[test]
+    fn model_from_snapshot_uses_latest_provider_changed() {
+        let raw = json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {"kind": {"type": "provider_changed", "data": {
+                                "provider": "anthropic",
+                                "model": "claude-sonnet-4-5-20250929"
+                            }}},
+                            {"kind": {"type": "provider_changed", "data": {
+                                "provider": "xai",
+                                "model": "grok-4.5"
+                            }}}
+                        ]
+                    }
+                }
+            }
+        });
+        assert_eq!(model_from_snapshot(&raw).as_deref(), Some("xai/grok-4.5"));
+        let status = config_status("s1", None, &raw);
+        assert_eq!(status["model"], "xai/grok-4.5");
+        assert_eq!(status["config"]["model"], "xai/grok-4.5");
+    }
+
+    #[test]
+    fn config_values_read_model_from_raw_select() {
+        let raw = json!({
+            "configOptions": [
+                {
+                    "id": "profile",
+                    "name": "Profile",
+                    "type": "select",
+                    "currentValue": "default"
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "type": "select",
+                    "currentValue": "xai/grok-4.5",
+                    "options": [{"value": "xai/grok-4.5", "name": "grok-4.5"}]
+                }
+            ]
+        });
+        let values = config_values_from_raw(&raw);
+        assert_eq!(values["profile"], "default");
+        assert_eq!(values["model"], "xai/grok-4.5");
     }
 }

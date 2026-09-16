@@ -13,9 +13,11 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::events;
 use crate::output;
 use crate::policy::{self, PermissionPolicy};
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -26,6 +28,8 @@ pub struct AcpClient {
     tx: mpsc::UnboundedSender<Message>,
     pending: PendingRequests,
     next_id: AtomicI64,
+    initialized: Mutex<Option<acp::InitializeResponse>>,
+    assistant_text: Arc<Mutex<String>>,
 }
 
 impl AcpClient {
@@ -35,8 +39,14 @@ impl AcpClient {
         permission: PermissionPolicy,
         stream_events: bool,
     ) -> Result<Self> {
-        let (socket, _) = connect_async(url)
+        let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "connect {endpoint} timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
             .with_context(|| format!("connect {endpoint}"))?;
         let (mut write, mut read) = socket.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -55,6 +65,8 @@ impl AcpClient {
 
         let pending_read = pending.clone();
         let tx_read = tx.clone();
+        let assistant_text = Arc::new(Mutex::new(String::new()));
+        let assistant_read = assistant_text.clone();
         tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
@@ -62,6 +74,7 @@ impl AcpClient {
                         if let Err(err) = handle_inbound(
                             &pending_read,
                             &tx_read,
+                            &assistant_read,
                             text.as_ref(),
                             permission,
                             stream_events,
@@ -86,19 +99,36 @@ impl AcpClient {
             tx,
             pending,
             next_id: AtomicI64::new(1),
+            initialized: Mutex::new(None),
+            assistant_text,
         })
     }
 
+    pub async fn take_assistant_text(&self) -> String {
+        let mut text = self.assistant_text.lock().await;
+        std::mem::take(&mut *text)
+    }
+
+    pub async fn snapshot_assistant_text(&self) -> String {
+        self.assistant_text.lock().await.clone()
+    }
+
     pub async fn initialize(&self) -> Result<acp::InitializeResponse> {
-        self.request(
-            acp::InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(client_capabilities())
-                .client_info(acp::Implementation::new(
-                    "qmtacp",
-                    env!("CARGO_PKG_VERSION"),
-                )),
-        )
-        .await
+        if let Some(cached) = self.initialized.lock().await.clone() {
+            return Ok(cached);
+        }
+        let response = self
+            .request(
+                acp::InitializeRequest::new(ProtocolVersion::V1)
+                    .client_capabilities(client_capabilities())
+                    .client_info(acp::Implementation::new(
+                        "qmtacp",
+                        env!("CARGO_PKG_VERSION"),
+                    )),
+            )
+            .await?;
+        *self.initialized.lock().await = Some(response.clone());
+        Ok(response)
     }
 
     pub async fn extension(&self, method: &str, params: Value) -> Result<Value> {
@@ -114,12 +144,12 @@ impl AcpClient {
         &self,
         cwd: impl Into<std::path::PathBuf>,
         profile: Option<&str>,
-    ) -> Result<acp::NewSessionResponse> {
+    ) -> Result<(acp::NewSessionResponse, Value)> {
         let mut request = acp::NewSessionRequest::new(cwd.into());
         if let Some(profile_id) = profile {
             request = request.meta(crate::session::profile_meta(profile_id));
         }
-        self.request(request).await
+        self.request_json(request).await
     }
 
     pub async fn list_sessions(
@@ -141,8 +171,8 @@ impl AcpClient {
         &self,
         session_id: String,
         cwd: std::path::PathBuf,
-    ) -> Result<acp::LoadSessionResponse> {
-        self.request(acp::LoadSessionRequest::new(session_id, cwd))
+    ) -> Result<(acp::LoadSessionResponse, Value)> {
+        self.request_json(acp::LoadSessionRequest::new(session_id, cwd))
             .await
     }
 
@@ -150,8 +180,8 @@ impl AcpClient {
         &self,
         session_id: String,
         cwd: std::path::PathBuf,
-    ) -> Result<acp::ResumeSessionResponse> {
-        self.request(acp::ResumeSessionRequest::new(session_id, cwd))
+    ) -> Result<(acp::ResumeSessionResponse, Value)> {
+        self.request_json(acp::ResumeSessionRequest::new(session_id, cwd))
             .await
     }
 
@@ -174,8 +204,8 @@ impl AcpClient {
         session_id: String,
         config_id: &str,
         value: &str,
-    ) -> Result<acp::SetSessionConfigOptionResponse> {
-        self.request(acp::SetSessionConfigOptionRequest::new(
+    ) -> Result<(acp::SetSessionConfigOptionResponse, Value)> {
+        self.request_json(acp::SetSessionConfigOptionRequest::new(
             session_id,
             config_id.to_string(),
             value,
@@ -208,7 +238,15 @@ impl AcpClient {
         R: JsonRpcRequest + Send + Sync + 'static,
         R::Response: Send + 'static,
     {
-        self.request_with_timeout(request, REQUEST_TIMEOUT).await
+        Ok(self.request_with_json(request, REQUEST_TIMEOUT).await?.0)
+    }
+
+    pub async fn request_json<R>(&self, request: R) -> Result<(R::Response, Value)>
+    where
+        R: JsonRpcRequest + Send + Sync + 'static,
+        R::Response: Send + 'static,
+    {
+        self.request_with_json(request, REQUEST_TIMEOUT).await
     }
 
     async fn request_with_timeout<R>(&self, request: R, timeout: Duration) -> Result<R::Response>
@@ -216,10 +254,23 @@ impl AcpClient {
         R: JsonRpcRequest + Send + Sync + 'static,
         R::Response: Send + 'static,
     {
+        Ok(self.request_with_json(request, timeout).await?.0)
+    }
+
+    async fn request_with_json<R>(
+        &self,
+        request: R,
+        timeout: Duration,
+    ) -> Result<(R::Response, Value)>
+    where
+        R: JsonRpcRequest + Send + Sync + 'static,
+        R::Response: Send + 'static,
+    {
         let message = request.to_untyped_message()?;
         let method = message.method.clone();
         let result = self.request_raw(&method, message.params, timeout).await?;
-        Ok(R::Response::from_value(&method, result)?)
+        let typed = R::Response::from_value(&method, result.clone())?;
+        Ok((typed, result))
     }
 
     fn notify<N>(&self, notification: N) -> Result<()>
@@ -277,6 +328,7 @@ async fn fail_pending(pending: &PendingRequests, message: impl Into<String>) {
 async fn handle_inbound(
     pending: &PendingRequests,
     tx: &mpsc::UnboundedSender<Message>,
+    assistant_text: &Mutex<String>,
     text: &str,
     permission: PermissionPolicy,
     stream_events: bool,
@@ -304,11 +356,14 @@ async fn handle_inbound(
         .to_string();
     let params = value.get("params").cloned().unwrap_or(Value::Null);
     if stream_events && method == "session/update" {
-        let _ = output::write_event(&json!({
-            "type": "update",
-            "sessionId": params.get("sessionId"),
-            "update": params.get("update"),
-        }));
+        let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
+        let update = params.get("update").cloned().unwrap_or(Value::Null);
+        if let Some(event) = events::compact_session_update(&session_id, &update) {
+            events::observe_assistant_text(&mut *assistant_text.lock().await, &event);
+            if stream_events {
+                let _ = output::write_event(&event);
+            }
+        }
     }
 
     if let Some(id) = value.get("id").cloned() {
