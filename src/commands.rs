@@ -907,8 +907,10 @@ async fn submit_input(
     } else {
         run_id
     };
+    let client_input_id = uuid::Uuid::new_v4().to_string();
     let mut params = json!({
         "session_id": session_id,
+        "client_input_id": client_input_id,
         "prompt": [{ "type": "text", "text": text }],
     });
     if let Some(run_id) = run_id {
@@ -923,6 +925,7 @@ async fn submit_input(
         .map_err(CliError::from_request)?;
     Ok(json!({
         "sessionId": session_id,
+        "clientInputId": client_input_id,
         "result": extension_payload(&response),
     }))
 }

@@ -360,10 +360,16 @@ async fn handle_inbound(
         let update = params.get("update").cloned().unwrap_or(Value::Null);
         if let Some(event) = events::compact_session_update(&session_id, &update) {
             events::observe_assistant_text(&mut *assistant_text.lock().await, &event);
-            if stream_events {
-                let _ = output::write_event(&event);
-            }
+            let _ = output::write_event(&event);
         }
+    } else if stream_events
+        && matches!(
+            method.as_str(),
+            "querymt/session/inputState" | "_querymt/session/inputState"
+        )
+        && let Some(event) = events::compact_input_state(&params)
+    {
+        let _ = output::write_event(&event);
     }
 
     if let Some(id) = value.get("id").cloned() {
