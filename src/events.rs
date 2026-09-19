@@ -12,6 +12,48 @@ pub fn observe_assistant_text(buffer: &mut String, event: &Value) {
     }
 }
 
+pub fn compact_input_state(params: &Value) -> Option<Value> {
+    let session_id = params
+        .get("session_id")
+        .or_else(|| params.get("sessionId"))?
+        .clone();
+    let input_id = params
+        .get("input_id")
+        .or_else(|| params.get("inputId"))?
+        .clone();
+    let mut event = serde_json::Map::from_iter([
+        ("type".to_string(), json!("input_state")),
+        (
+            "version".to_string(),
+            params.get("version").cloned().unwrap_or_else(|| json!(1)),
+        ),
+        ("sessionId".to_string(), session_id),
+        ("inputId".to_string(), input_id),
+        (
+            "delivery".to_string(),
+            params.get("delivery").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "state".to_string(),
+            params.get("state").cloned().unwrap_or(Value::Null),
+        ),
+    ]);
+    for (output_key, input_keys) in [
+        ("runId", ["run_id", "runId"]),
+        ("latencyMs", ["latency_ms", "latencyMs"]),
+    ] {
+        if let Some(value) = input_keys.iter().find_map(|key| params.get(*key)).cloned() {
+            event.insert(output_key.to_string(), value);
+        }
+    }
+    for key in ["position", "boundary", "reason"] {
+        if let Some(value) = params.get(key).cloned() {
+            event.insert(key.to_string(), value);
+        }
+    }
+    Some(Value::Object(event))
+}
+
 pub fn compact_session_update(session_id: &Value, update: &Value) -> Option<Value> {
     let kind = update
         .get("sessionUpdate")
@@ -83,6 +125,28 @@ fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_input_state_notification() {
+        let event = compact_input_state(&json!({
+            "version": 1,
+            "session_id": "s1",
+            "input_id": "i1",
+            "delivery": "steer",
+            "state": "applied",
+            "run_id": "r1",
+            "boundary": "after_tools",
+            "latency_ms": 42
+        }))
+        .unwrap();
+        assert_eq!(event["type"], "input_state");
+        assert_eq!(event["sessionId"], "s1");
+        assert_eq!(event["inputId"], "i1");
+        assert_eq!(event["state"], "applied");
+        assert_eq!(event["runId"], "r1");
+        assert_eq!(event["latencyMs"], 42);
+        assert!(event.get("position").is_none());
+    }
 
     #[test]
     fn compact_agent_text_chunk() {
