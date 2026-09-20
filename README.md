@@ -23,11 +23,14 @@ cargo run -- set-mode SESSION_ID plan
 cargo run -- cancel SESSION_ID
 ```
 
-`prompt` streams compact NDJSON (`text`, `tool`, `mode`, `plan`, `done`) and waits until
-the session is idle, including queued turns. `done` includes assembled assistant
-`text`. For an existing busy session, `--delivery auto` (default) steers if
-possible, otherwise queues. `follow SESSION` streams updates until idle. `exec`
-runs multiple commands on one connection. `--quiet` hides connection logs.
+`prompt` streams compact NDJSON (`text`, `tool`, `mode`, `plan`, `input_state`,
+`done`) and waits until the session is idle, including queued turns. `done`
+includes assembled assistant `text`. For an existing busy session,
+`--delivery auto` (default) steers if possible, otherwise queues. The
+`INPUT_ID` passed to `discard-queued` is the `inputId` from an `input_state`
+event, which matches the `clientInputId` returned when the input is submitted.
+`follow SESSION` streams updates until idle. `exec` runs multiple commands on
+one connection. `--quiet` hides connection logs.
 
 `--permission allow-once` is the default so coder tools can run. Elicitation
 requests are cancelled and emitted as NDJSON events during `prompt`.
