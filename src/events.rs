@@ -149,6 +149,22 @@ mod tests {
     }
 
     #[test]
+    fn compact_discarded_queue_notification() {
+        let event = compact_input_state(&json!({
+            "version": 1,
+            "session_id": "s1",
+            "input_id": "i2",
+            "delivery": "queue",
+            "state": "discarded",
+            "reason": "removed_by_user"
+        }))
+        .unwrap();
+        assert_eq!(event["delivery"], "queue");
+        assert_eq!(event["state"], "discarded");
+        assert_eq!(event["reason"], "removed_by_user");
+    }
+
+    #[test]
     fn compact_agent_text_chunk() {
         let event = compact_session_update(
             &json!("s1"),

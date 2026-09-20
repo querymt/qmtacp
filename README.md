@@ -17,6 +17,7 @@ cargo run -- runtime SESSION_ID
 cargo run -- follow SESSION_ID
 cargo run -- steer SESSION_ID --run-id RUN "stop and summarize"
 cargo run -- queue SESSION_ID "next: run tests"
+cargo run -- discard-queued SESSION_ID INPUT_ID
 cargo run -- inspect SESSION_ID --messages 20
 cargo run -- set-mode SESSION_ID plan
 cargo run -- cancel SESSION_ID
