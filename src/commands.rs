@@ -157,6 +157,11 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         text: Vec<String>,
     },
+    /// Remove an input that has not started from the session queue.
+    DiscardQueued {
+        session_id: String,
+        input_id: String,
+    },
     /// Run multiple commands on one connection. Lines from stdin or remaining args.
     Exec {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -283,6 +288,10 @@ pub async fn run(
             pretty,
             submit_input(client, "querymt/session/queue", session_id, None, text).await?,
         ),
+        Command::DiscardQueued {
+            session_id,
+            input_id,
+        } => write_ok(pretty, discard_queued(client, session_id, input_id).await?),
         Command::Exec { commands } => exec(client, commands, pretty).await,
         Command::Cancel { session_id } => write_ok(pretty, cancel(client, session_id).await?),
         Command::Close { session_id } => write_ok(pretty, close(client, session_id).await?),
@@ -907,8 +916,10 @@ async fn submit_input(
     } else {
         run_id
     };
+    let client_input_id = uuid::Uuid::new_v4().to_string();
     let mut params = json!({
         "session_id": session_id,
+        "client_input_id": client_input_id,
         "prompt": [{ "type": "text", "text": text }],
     });
     if let Some(run_id) = run_id {
@@ -923,6 +934,7 @@ async fn submit_input(
         .map_err(CliError::from_request)?;
     Ok(json!({
         "sessionId": session_id,
+        "clientInputId": client_input_id,
         "result": extension_payload(&response),
     }))
 }
@@ -998,6 +1010,29 @@ fn split_exec_args(line: &str) -> Vec<String> {
         args.push(current);
     }
     args
+}
+
+async fn discard_queued(
+    client: &AcpClient,
+    session_id: String,
+    input_id: String,
+) -> Result<Value, CliError> {
+    client.initialize().await.map_err(CliError::from_request)?;
+    let response = client
+        .extension(
+            "querymt/session/discardQueuedInput",
+            json!({
+                "session_id": session_id,
+                "input_id": input_id,
+            }),
+        )
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(json!({
+        "sessionId": session_id,
+        "inputId": input_id,
+        "result": extension_payload(&response),
+    }))
 }
 
 async fn cancel(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
@@ -1179,6 +1214,16 @@ mod tests {
             Command::Sessions { limit, .. } => assert_eq!(limit, Some(5)),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn exec_line_parses_discard_queued_command() {
+        let command = parse_exec_line("discard-queued session-1 input-1").unwrap();
+        assert!(matches!(
+            command,
+            Command::DiscardQueued { session_id, input_id }
+                if session_id == "session-1" && input_id == "input-1"
+        ));
     }
 
     #[test]
