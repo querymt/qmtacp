@@ -28,6 +28,9 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+          env = {
+            QMTACP_GIT_SHA = self.shortRev or self.dirtyShortRev or "unknown";
+          };
           auditable = false;
           doCheck = false;
         };

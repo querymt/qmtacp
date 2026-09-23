@@ -18,9 +18,12 @@ use crate::error::{CliError, ExitCode};
 use crate::policy::PermissionPolicy;
 use crate::url::{DEFAULT_HOST, normalize_acp_ws_url, safe_endpoint_label};
 
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("QMTACP_GIT_SHA"), ")");
+
 #[derive(Parser)]
 #[command(name = "qmtacp")]
 #[command(about = "JSON CLI for a running QueryMT ACP WebSocket server")]
+#[command(version = VERSION)]
 struct Cli {
     /// ACP WebSocket URL or host[:port][/path]. Defaults to ws://127.0.0.1:3030/ws
     #[arg(short, long, value_name = "url")]

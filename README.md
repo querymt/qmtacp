@@ -6,6 +6,29 @@ Default endpoint is `ws://127.0.0.1:3030/ws`.
 Each invocation connects, initializes, does one job, and exits. Session ids
 are the only state. JSON goes to stdout; connection logs go to stderr.
 
+## Install
+
+Cargo:
+
+```sh
+cargo install --path .
+cargo install --git https://github.com/querymt/qmtacp
+```
+
+Nix profile:
+
+```sh
+nix profile install .
+nix profile install github:querymt/qmtacp
+```
+
+```sh
+qmtacp --version
+qmtacp --help
+```
+
+`--version` prints `qmtacp <crate-version> (<short-git-sha>)` and does not connect.
+
 ```sh
 cargo run -- caps
 cargo run -- new --cwd . --profile default --mode build
